@@ -1077,10 +1077,24 @@ body {
     return Number.isFinite(n) && n >= 0 ? n : 0;
   };
 
+  // Ambil field pertama yang terisi, sekaligus mencoba ejaan snake_case (cloud Euler Stream memakai keduanya).
+  function ambil(obj, ...nama) {
+    if (!obj || typeof obj !== "object") return undefined;
+    for (const n of nama) {
+      const snake = n.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+      for (const k of [n, snake]) {
+        const v = obj[k];
+        if (v !== undefined && v !== null && v !== "") return v;
+      }
+    }
+    return undefined;
+  }
+
   function pengguna(d) {
     const u = d && typeof d.user === "object" && d.user ? d.user : d || {};
-    const id = teks(u.uniqueId) || teks(d.uniqueId) || teks(u.userId) || teks(d.userId);
-    let nama = (teks(u.nickname) || teks(d.nickname) || id).replace(/\s+/g, " ").trim();
+    const id = teks(ambil(u, "uniqueId", "userId", "displayId")) || teks(ambil(d, "uniqueId", "userId"));
+    let nama = (teks(ambil(u, "nickname", "nickName", "nickname_str")) || teks(ambil(d, "nickname", "nickName")) || id)
+      .replace(/\s+/g, " ").trim();
     if (nama.length > PANJANG_NAMA) nama = nama.slice(0, PANJANG_NAMA - 1) + "…";
     return { id: id || nama, nama };
   }
@@ -1154,11 +1168,11 @@ body {
   };
 
   // Pesan mentah → event seragam → saatEvent. Follow/share kembar (event "social" + "follow") dibuang.
-  function buatPenerima(saatEvent) {
+  function buatPenerima(saatEvent, urai = normalisasi) {
     const terakhir = new Map(); // kunci follow/share → waktu terakhir
     return function terima(pesan) {
       const kini = Date.now();
-      for (const e of normalisasi(pesan)) {
+      for (const e of urai(pesan)) {
         if (e.jenis === "follow" || e.jenis === "share") {
           const kunci = e.jenis + ":" + e.id;
           if (kini - (terakhir.get(kunci) || 0) < JENDELA_KEMBAR) continue;
@@ -1223,7 +1237,125 @@ body {
     return { terima: buatPenerima(saatEvent), tutup() {} };
   }
 
-  Prisma.tiktok = { pasang, tanpaSambungan, normalisasi };
+  /* ---------- Mode cloud: langsung ke WebSocket Euler Stream, tanpa aplikasi apa pun di PC ----------
+     Alamat: wss://ws.eulerstream.com?uniqueId=<akun>&apiKey=<key>
+     Pesannya dibungkus { messages: [ ... ] }; tiap isi memakai nama tipe gaya protobuf
+     ("WebcastLikeMessage") atau nama pendek ("like"), dengan field camelCase atau snake_case. */
+  const ALAMAT_EULER = "wss://ws.eulerstream.com";
+  const TUTUP_TIDAK_LIVE = 4404; // ClientCloseCode.NOT_LIVE
+
+  function jenisEuler(nama) {
+    const n = teks(nama).toLowerCase();
+    if (/gift/.test(n)) return "gift";
+    if (/like/.test(n)) return "like";
+    if (/follow/.test(n)) return "follow";
+    if (/share/.test(n)) return "share";
+    if (/social/.test(n)) return "social";
+    if (/member|join/.test(n)) return "member";
+    if (/roomuser|viewer|room_?user/.test(n)) return "roomUser";
+    return "";
+  }
+
+  // Satu isi pesan cloud → bentuk pesan yang sama seperti TikFinity, lalu dipakai normalisasi() yang sudah ada.
+  function eulerKeTikFinity(item) {
+    if (!item || typeof item !== "object") return null;
+    const jenis = jenisEuler(ambil(item, "type", "event", "method", "name", "messageType"));
+    if (!jenis) return null;
+    const d = (typeof item.data === "object" && item.data) || (typeof item.payload === "object" && item.payload) || item;
+    const hadiah = ambil(d, "giftName") || ambil(ambil(d, "giftDetails", "gift") || {}, "giftName", "name");
+    const data = {
+      user: (typeof d.user === "object" && d.user) || undefined,
+      uniqueId: ambil(d, "uniqueId"),
+      nickname: ambil(d, "nickname", "nickName"),
+      likeCount: ambil(d, "likeCount", "count"),
+      totalLikeCount: ambil(d, "totalLikeCount", "total"),
+      viewerCount: ambil(d, "viewerCount", "totalUser", "viewer"),
+      giftName: hadiah,
+      giftType: ambil(d, "giftType") ?? ambil(ambil(d, "giftDetails", "gift") || {}, "giftType", "type"),
+      repeatCount: ambil(d, "repeatCount"),
+      repeatEnd: ambil(d, "repeatEnd"),
+      displayType: ambil(d, "displayType"),
+      label: ambil(d, "label"),
+      action: ambil(d, "action"),
+    };
+    return { event: jenis, data };
+  }
+
+  // Pesan mentah dari cloud → daftar event seragam (dipakai juga oleh uji).
+  function normalisasiEuler(pesan) {
+    let p = pesan;
+    if (typeof p === "string") {
+      try {
+        p = JSON.parse(p);
+      } catch (_) {
+        return [];
+      }
+    }
+    if (!p || typeof p !== "object") return [];
+    const daftar = Array.isArray(p.messages) ? p.messages : Array.isArray(p) ? p : [p];
+    const hasil = [];
+    for (const item of daftar) {
+      const pesanTikFinity = eulerKeTikFinity(item);
+      if (pesanTikFinity) hasil.push(...normalisasi(pesanTikFinity));
+    }
+    return hasil;
+  }
+
+  function pasangEuler({ akun, apiKey, alamat, saatEvent, saatStatus } = {}) {
+    const dasar = alamat || ALAMAT_EULER;
+    const url = dasar + (dasar.includes("?") ? "&" : "?") +
+      "uniqueId=" + encodeURIComponent(String(akun || "").replace(/^@/, "")) +
+      (apiKey ? "&apiKey=" + encodeURIComponent(apiKey) : "");
+
+    const terima = buatPenerima(saatEvent, normalisasiEuler);
+    let ws = null;
+    let jeda = JEDA_AWAL;
+    let timer = 0;
+    let berhenti = false;
+
+    function sambung() {
+      if (berhenti) return;
+      lapor(saatStatus, "menyambung");
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        lapor(saatStatus, "terputus");
+        jadwalUlang(JEDA_MAKS);
+        return;
+      }
+      ws.onopen = () => {
+        jeda = JEDA_AWAL;
+        lapor(saatStatus, "terhubung");
+      };
+      ws.onmessage = (m) => terima(m.data);
+      ws.onclose = (ev) => {
+        ws = null;
+        lapor(saatStatus, "terputus");
+        // Akun belum live: tunggu lebih lama supaya kuota harian tidak habis untuk mencoba terus.
+        jadwalUlang(ev && ev.code === TUTUP_TIDAK_LIVE ? 20000 : 0);
+      };
+      ws.onerror = () => {};
+    }
+
+    function jadwalUlang(paksa) {
+      if (berhenti) return;
+      clearTimeout(timer);
+      timer = setTimeout(sambung, paksa || jeda);
+      jeda = Math.min(JEDA_MAKS, jeda * 1.6);
+    }
+
+    sambung();
+    return {
+      terima,
+      tutup() {
+        berhenti = true;
+        clearTimeout(timer);
+        if (ws) ws.close();
+      },
+    };
+  }
+
+  Prisma.tiktok = { pasang, pasangEuler, tanpaSambungan, normalisasi, normalisasiEuler };
 })();
 
 </script>
@@ -1233,7 +1365,11 @@ body {
 
   const { config, format, loop, stage, orb, tiktok } = window.Prisma;
   const cfg = config.baca({
-    ws: "ws://127.0.0.1:21213", // WebSocket TikFinity Desktop
+    ws: "ws://127.0.0.1:21213", // WebSocket TikFinity Desktop (dipakai kalau `akun` kosong)
+    akun: "",                   // username TikTok → mode cloud Euler Stream, tanpa aplikasi di PC
+    key: "",                    // API key Euler Stream (wajib untuk mode cloud)
+    wsCloud: "",                // alamat WebSocket cloud, kosong = wss://ws.eulerstream.com
+    sumber: "",                 // nama sumber di layar saat belum tersambung; kosong = otomatis
     join: true, like: true, follow: true, share: true, gift: true,
     feed: 6,        // jumlah baris daftar
     life: 12,       // detik sebelum baris hilang
@@ -1248,6 +1384,7 @@ body {
   const TEKS_AKSI = { join: "bergabung", like: "menyukai", follow: "mengikuti", share: "membagikan live", gift: "mengirim" };
   const LABEL_SOROT = { follow: "FOLLOW BARU", share: "MEMBAGIKAN LIVE", gift: "MENGIRIM HADIAH" };
 
+  const rapikan = (teks) => String(teks).replace(/\s+/g, " ").trim();
   const $ = (id) => document.getElementById(id);
   const stageEl = $("stage");
   const umpan = $("umpan");
@@ -1263,7 +1400,7 @@ body {
     if (cfg.demo) t = "TOTAL LIKE · MODE DEMO";
     else if (status === "terhubung" || stageEl.classList.contains("terhubung")) {
       t = "TOTAL LIKE" + (like.penonton !== null ? " · " + format.angka(like.penonton) + " PENONTON" : "");
-    } else t = "MENUNGGU TIKFINITY…";
+    } else t = "MENUNGGU " + (rapikan(cfg.sumber) || "DATA").toUpperCase() + "…";
     if (t !== like.teks) $("keterangan").textContent = like.teks = t;
   }
   loop.sub((dt) => {
@@ -1425,9 +1562,13 @@ body {
     satu();
   }
 
+  const akun = rapikan(cfg.akun).replace(/^@/, "");
+  const modeCloud = Boolean(akun);
+  if (!cfg.sumber) cfg.sumber = modeCloud ? "TikTok" : "TikFinity";
   stageEl.classList.toggle("demo", cfg.demo);
   tulisKeterangan("menyambung");
   if (cfg.demo) jalankanDemo(tiktok.tanpaSambungan({ saatEvent }).terima);
+  else if (modeCloud) tiktok.pasangEuler({ akun, apiKey: cfg.key, alamat: cfg.wsCloud, saatEvent, saatStatus });
   else tiktok.pasang({ alamat: cfg.ws, saatEvent, saatStatus });
 
   stage.pasang({ layouts: { tall: { w: 600, h: 900 } } });
