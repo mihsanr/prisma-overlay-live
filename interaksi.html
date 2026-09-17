@@ -1242,7 +1242,8 @@ body {
      Pesannya dibungkus { messages: [ ... ] }; tiap isi memakai nama tipe gaya protobuf
      ("WebcastLikeMessage") atau nama pendek ("like"), dengan field camelCase atau snake_case. */
   const ALAMAT_EULER = "wss://ws.eulerstream.com";
-  const TUTUP_TIDAK_LIVE = 4404; // ClientCloseCode.NOT_LIVE
+  const TUTUP_TIDAK_LIVE = 4404;          // ClientCloseCode.NOT_LIVE
+  const TUTUP_KUNCI = [4400, 4401, 4403]; // API key kurang / tidak sah / kuota habis
 
   function jenisEuler(nama) {
     const n = teks(nama).toLowerCase();
@@ -1330,9 +1331,17 @@ body {
       ws.onmessage = (m) => terima(m.data);
       ws.onclose = (ev) => {
         ws = null;
+        const kode = ev && ev.code;
+        if (TUTUP_KUNCI.includes(kode)) {
+          // API key belum diisi / ditolak: percuma mencoba cepat-cepat, dan pesannya perlu terlihat.
+          console.warn("[prisma] euler:", (ev && ev.reason) || "API key ditolak");
+          lapor(saatStatus, "butuh-kunci");
+          jadwalUlang(60000);
+          return;
+        }
         lapor(saatStatus, "terputus");
         // Akun belum live: tunggu lebih lama supaya kuota harian tidak habis untuk mencoba terus.
-        jadwalUlang(ev && ev.code === TUTUP_TIDAK_LIVE ? 20000 : 0);
+        jadwalUlang(kode === TUTUP_TIDAK_LIVE ? 20000 : 0);
       };
       ws.onerror = () => {};
     }
@@ -1400,7 +1409,8 @@ body {
     if (cfg.demo) t = "TOTAL LIKE · MODE DEMO";
     else if (status === "terhubung" || stageEl.classList.contains("terhubung")) {
       t = "TOTAL LIKE" + (like.penonton !== null ? " · " + format.angka(like.penonton) + " PENONTON" : "");
-    } else t = "MENUNGGU " + (rapikan(cfg.sumber) || "DATA").toUpperCase() + "…";
+    } else if (status === "butuh-kunci" || stageEl.classList.contains("butuh-kunci")) t = "API KEY EULER DIPERLUKAN";
+    else t = "MENUNGGU " + (rapikan(cfg.sumber) || "DATA").toUpperCase() + "…";
     if (t !== like.teks) $("keterangan").textContent = like.teks = t;
   }
   loop.sub((dt) => {
@@ -1532,6 +1542,9 @@ body {
 
   function saatStatus(status) {
     stageEl.classList.toggle("terhubung", status === "terhubung");
+    // Sekali API key ditolak, pesan itu bertahan sampai benar-benar tersambung.
+    if (status === "butuh-kunci") stageEl.classList.add("butuh-kunci");
+    if (status === "terhubung") stageEl.classList.remove("butuh-kunci");
     tulisKeterangan(status);
   }
 
